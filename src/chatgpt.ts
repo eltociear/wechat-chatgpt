@@ -4,17 +4,26 @@ import { config } from "./config.js";
 import { execa } from "execa";
 import { Cache } from "./cache.js";
 import { ContactInterface, RoomInterface } from "wechaty/impls";
-
+import {
+  IChatGPTItem,
+  IConversationItem,
+  isAccountWithUserInfo,
+  isAccountWithSessionToken,
+} from "./interface.js";
 const SINGLE_MESSAGE_MAX_SIZE = 500;
-export class ChatGPTBot {
-  // Record talkid with conversation id
-  conversations = new Map<string, ChatGPTConversation>();
-  chatGPTPools: Array<ChatGPTAPI> | [] = [];
+const ErrorCode2Message: Record<string, string> = {
+  "503":
+    "OpenAI 服务器繁忙，请稍后再试| The OpenAI server is busy, please try again later",
+  "429":
+    "OpenAI 服务器限流，请稍后再试| The OpenAI server was limted, please try again later",
+  "500":
+    "OpenAI 服务器繁忙，请稍后再试| The OpenAI server is busy, please try again later",
+  unknown: "未知错误，请看日志 | Error unknown, please see the log",
+};
+export class ChatGPTPoole {
+  chatGPTPools: Array<IChatGPTItem> | [] = [];
+  conversationsPool: Map<string, IConversationItem> = new Map();
   cache = new Cache("cache.json");
-  botName: string = "";
-  setBotName(botName: string) {
-    this.botName = botName;
-  }
   async getSessionToken(email: string, password: string): Promise<string> {
     if (this.cache.get(email)) {
       return this.cache.get(email);
@@ -33,59 +42,91 @@ export class ChatGPTBot {
     }
     return "";
   }
+  async startPools() {
+    const sessionAccounts = config.chatGPTAccountPool.filter(
+      isAccountWithSessionToken
+    );
+    const userAccounts = await Promise.all(
+      config.chatGPTAccountPool
+        .filter(isAccountWithUserInfo)
+        .map(async (account) => {
+          const session_token = await this.getSessionToken(
+            account.email,
+            account.password
+          );
+          return {
+            ...account,
+            session_token,
+          };
+        })
+    );
+    this.chatGPTPools = [...sessionAccounts, ...userAccounts].map((account) => {
+      return {
+        chatGpt: new ChatGPTAPI({
+          sessionToken: account.session_token,
+        }),
+        account,
+      };
+    });
+    console.log(`ChatGPTPools: ${this.chatGPTPools.length}`);
+  }
+  // Randome get chatgpt item form pool
+  get chatGPTAPI(): IChatGPTItem {
+    return this.chatGPTPools[
+      Math.floor(Math.random() * this.chatGPTPools.length)
+    ];
+  }
+  // Randome get conversation item form pool
+  getConversation(talkid: string): IConversationItem {
+    if (this.conversationsPool.has(talkid)) {
+      return this.conversationsPool.get(talkid) as IConversationItem;
+    }
+    const chatGPT = this.chatGPTAPI;
+    const conversation = chatGPT.chatGpt.getConversation();
+    return {
+      conversation,
+      account: chatGPT.account,
+    };
+  }
+  // send message with talkid
+  async sendMessage(message: string, talkid: string) {
+    const conversationItem = this.getConversation(talkid);
+    const { conversation, account } = conversationItem;
+    try {
+      // TODO: Add Retry logic
+      const response = await conversation.sendMessage(message);
+      return response;
+    } catch (err: any) {
+      console.error(
+        `err is ${err.message}, account ${JSON.stringify(err.account)}`
+      );
+      // If send message failed, we will remove the conversation from pool
+      this.conversationsPool.delete(talkid);
+      // Retry
+      return this.error2msg(err);
+    }
+  }
+  // Make error code to more human readable message.
+  error2msg(err: Error): string {
+    for (const code in Object.keys(ErrorCode2Message)) {
+      if (err.message.includes(code)) {
+        return ErrorCode2Message[code];
+      }
+    }
+    return ErrorCode2Message.unknown;
+  }
+}
+export class ChatGPTBot {
+  // Record talkid with conversation id
+  conversations = new Map<string, ChatGPTConversation>();
+  chatGPTPool = new ChatGPTPoole();
+  cache = new Cache("cache.json");
+  botName: string = "";
+  setBotName(botName: string) {
+    this.botName = botName;
+  }
   async startGPTBot() {
-    const chatGPTPools = (
-      await Promise.all(
-        config.chatGPTAccountPool.map(
-          async (account: {
-            email?: string;
-            password?: string;
-            session_token?: string;
-          }): Promise<string> => {
-            if (account.session_token) {
-              return account.session_token;
-            } else if (account.email && account.password) {
-              return await this.getSessionToken(
-                account.email,
-                account.password
-              );
-            } else {
-              return "";
-            }
-          }
-        )
-      )
-    )
-      .filter((token: string) => token !== "")
-      .map((token: string) => {
-        return new ChatGPTAPI({
-          sessionToken: token,
-        });
-      });
-    console.log(`Chatgpt pool size: ${chatGPTPools.length}`);
-    this.chatGPTPools = chatGPTPools;
-  }
-  get chatgpt(): ChatGPTAPI {
-    if (this.chatGPTPools.length === 0) {
-      throw new Error("No chatgpt session token");
-    } else if (this.chatGPTPools.length === 1) {
-      return this.chatGPTPools[0];
-    }
-    const index = Math.floor(Math.random() * this.chatGPTPools.length);
-    return this.chatGPTPools[index];
-  }
-  resetConversation(talkerId: string): void {
-    const chatgpt = this.chatgpt;
-    this.conversations.set(talkerId, chatgpt.getConversation());
-  }
-  getConversation(talkerId: string): ChatGPTConversation {
-    const chatgpt = this.chatgpt;
-    if (this.conversations.get(talkerId) !== undefined) {
-      return this.conversations.get(talkerId) as ChatGPTConversation;
-    }
-    const conversation = chatgpt.getConversation();
-    this.conversations.set(talkerId, conversation);
-    return conversation;
+    await this.chatGPTPool.startPools();
   }
   // TODO: Add reset conversation id and ping pong
   async command(): Promise<void> {}
@@ -100,14 +141,7 @@ export class ChatGPTBot {
     return realText;
   }
   async getGPTMessage(text: string, talkerId: string): Promise<string> {
-    const conversation = this.getConversation(talkerId);
-    try {
-      return await conversation.sendMessage(text);
-    } catch (e) {
-      this.resetConversation(talkerId);
-      console.error(e);
-      return String(e);
-    }
+    return await this.chatGPTPool.sendMessage(text, talkerId);
   }
   // The message is segmented according to its size
   async trySay(
